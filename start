@@ -1,103 +1,379 @@
-#! /usr/bin/env ruby
-
+#! /usr/bin/ruby
 require 'json'
 require 'open3'
 require 'pathname'
 require 'fileutils'
+require 'base64'
 
 class NotRunningError < ArgumentError; end
 
-dir = Pathname.new(
-  ENV.fetch(
-    'STANDALONE_GAMESCOPE_TMP',
-    Pathname.new(File.expand_path(__FILE__)).dirname
+class Remover
+  attr_accessor :single
+
+  def initialize(single)
+    @single = single
+  end
+end
+
+DEFAULT_ARGS = %w[
+  --gs--nested-width= 2560 --gs--nested-height= 1440
+  --gs--output-width= 2560 --gs--output-height= 1440
+  --gs--backend= wayland
+  --gs--fullscreen
+  --gs--force-grab-cursor
+  --gs--hdr-enabled
+  --gs--adaptive-sync
+  --gs--hdr-itm-enable
+  --gs--hdr-itm-target-nits= 400
+  --gs--hdr-itm-sdr-nits= 100
+  --gs--hdr-sdr-content-nits= 400
+  ---sgs--force-dlss-latest-version
+  --sgs--force-dlss-rr
+  --sgs--force-dlss-fg
+  ---sgs--force-dlss-indicator
+  --sgs--force-dlss-profile-a= 0xffffff
+  --sgs--force-dlss-profile-b= 0xffffff
+]
+# --gs--nested-refresh= 60
+
+def dir
+  Pathname.new(
+    ENV.fetch(
+      'STANDALONE_GAMESCOPE_TMP',
+      Pathname.new(File.expand_path(__FILE__)).dirname
+    )
   )
-)
+end
+
+def argv
+  @argv
+end
+
+def argh
+  @argh.to_h
+end
+
+def gamescope_args
+  @gamescope_args
+end
+
+def gamescope_argh
+  @gamescope_argh
+end
+
+def gamescope_argh?(argname)
+  case @gamescope_argh[argname]
+  when String, true
+    true
+  else
+    false
+  end
+end
+
+def add_nvapi_env!
+  enable_dlls_overrides = false
+  force_dlss = true
+  force_dlss_rr = true
+  force_dlss_fg = true
+
+  drs_config_hash = {
+    "0x10E41E01": argh.key?('--force-dlss') ? '1' : nil,
+    "0x10E41E02": argh.key?('--force-dlss-rr') ? '1' : nil,
+    "0x10E41E03": argh.key?('--force-dlss-fg') ? '1' : nil,
+    "0x10E41DF3": argh['--force-dlss-profile-a'],
+    "0x10E41DF7": argh['--force-dlss-profile-b']
+  }
+
+  if drs_config_hash.any?
+    drs_config = drs_config_hash.compact.map { |k, v| "#{k}=#{v}" }.join(',')
+  end
+
+  additions = {
+    PROTON_ENABLE_NGX_UPDATER: argh.key?('--force-dlss-latest-version') ? '1' : '0',
+    DXVK_NVAPI_SET_DLSS_INDICATOR: argh.key?('--force-dlss-indicator') ? '1024' : nil,
+    DXVK_NVAPI_DRS_SETTINGS: drs_config
+  }.compact
+
+  additions.each { |k, v| ENV[k.to_s] = v.to_s }
+end
+
+begin
+  @gamescope_args = []
+  @args = []
+  @argv = []
+
+  argv_to_process = DEFAULT_ARGS + ARGV
+
+  @gamescope_argh = {}
+  @argh = {}
+
+  puts "INITIAL: #{gamescope_argh.inspect} #{gamescope_args.inspect}"
+
+  loop do
+    arg = argv_to_process.shift
+
+    break if arg.nil?
+
+    if arg.start_with?('--gs')
+      argname = arg.delete_prefix('--gs')
+      collector = @gamescope_argh
+    elsif arg.start_with?('---gs')
+      rmname = arg.delete_prefix('---gs')
+      collector = @gamescope_argh
+    elsif arg.start_with?('---sgs')
+      rmname = arg.delete_prefix('---sgs')
+      collector = @argh
+    elsif arg.start_with?('--sgs')
+      argname = arg.delete_prefix('--sgs')
+      collector = @argh
+    else
+      @argv << arg
+    end
+
+    if argname
+      argval = true
+
+      if arg.end_with?('=')
+        argname = argname.delete_suffix('=')
+        argval = argv_to_process.shift
+      end
+
+      collector[argname] = argval
+    elsif rmname
+      collector[rmname] = Remover.new(!arg.end_with?('='))
+    end
+  end
+
+  if gamescope_argh?('--nested-refresh')
+    @gamescope_argh['--adaptive-sync'] = Remover.new(true)
+  end
+
+  @gamescope_argh = Marshal.load(Base64.decode64(ENV['GAMESCOPE_ARGH'])) if ENV.key?('GAMESCOPE_ARGH')
+  @argh = Marshal.load(Base64.decode64(ENV['STANDALONE_GAMESCOPE_ARGH'])) if ENV.key?('STANDALONE_GAMESCOPE_ARGH')
+
+  ENV['GAMESCOPE_ARGH'] = Base64.strict_encode64(Marshal.dump(gamescope_argh))
+  ENV['STANDALONE_GAMESCOPE_ARGH'] = Base64.strict_encode64(Marshal.dump(argh))
+
+  [[gamescope_argh, @gamescope_args], [argh, @args]].each do |(collector, list)|
+    collector.each do |argname, argval|
+      default_idx = list.index(argname)
+      case argval
+      when String
+        list[default_idx, 2] = [] if default_idx
+        list.concat([argname, argval])
+      when true
+        list[default_idx, 1] = [] if default_idx
+        list << argname
+      when Remover
+        collector.delete(argname)
+        list[default_idx, argval.single ? 1 : 2] = [] if default_idx
+      end
+    end
+  end
+
+  puts "ARGH: #{argh.inspect} #{@args.inspect}"
+  add_nvapi_env!
+  puts "RUNNING GAMESCOPE WITH: #{gamescope_argh.inspect} #{gamescope_args.inspect}"
+end
 
 FileUtils.mkdir_p(dir)
 
-DEFAULT_GAMESCOPE_ARGS = %w[
-  -w 2560 -h 1440
-  -W 2560 -H 1440
-  --fullscreen
-  --hdr-enabled
-  --nested-refresh 165
-  --hdr-sdr-content-nits 100
-]
-
-argv = ARGV
-
-if argv.size.zero?
-  gamescope_args = ENV['GAMESCOPE_ARGS']&.split(/\s+/) || DEFAULT_GAMESCOPE_ARGS
-
-  ENV['ENABLE_HDR_WSI'] = '1' if gamescope_args.include?('--hdr-enabled')
-
-  File.write(dir.join('pre.env'), JSON.pretty_generate(ENV.to_h))
-
-  ret = Open3.capture2e(
-    ENV,
-    'gamescope',
-    *gamescope_args,
-    '--',
-    __FILE__,
-    'inside'
-  )
-      # --adaptive-sync
-  puts ret
-elsif argv[0] == 'inside'
-  ENV['STANDALONE_GAMESCOPE_PID'] = Process.pid.to_s
-
-  diff = (ENV.to_h.to_a - JSON.parse(File.read(dir.join('pre.env'))).to_a).to_h
-
-  File.write(dir.join('post.env'), JSON.pretty_generate(diff))
-
-  loop { sleep 1 }
-elsif argv[0] == 'game'
-  retries = 20
-  missing_gamescope_thread = nil
-
-  begin
-    diff_env = JSON.parse(File.read(dir.join('post.env'))) rescue {}
-    puts "checking pid: #{diff_env.to_json}"
-    inside_pid = diff_env['STANDALONE_GAMESCOPE_PID']
-
-    raise NotRunningError unless inside_pid
-
-    pid_exists = File.exist?("/proc/#{inside_pid}")
-
-    raise NotRunningError unless pid_exists
-
-    ENV.merge!(diff_env)
-    ENV.delete('WAYLAND_DISPLAY')
-
-    File.write(dir.join('game.env'), JSON.pretty_generate(ENV.to_h))
-    File.write(dir.join('game.command'), JSON.pretty_generate(ARGV.drop(1)))
-
-    ret = Open3.capture2e(ENV, *ARGV.drop(1))
-
-    File.write(dir.join('game.out'), ret[0])
-
-    puts ret
-  rescue NotRunningError => e
-    puts "retrying: #{missing_gamescope_thread}"
-
-    missing_gamescope_thread ||= Thread.new do
-      puts "Starting: #{__FILE__}"
-      puts Open3.capture2e(__FILE__)
-    end
-
-    sleep 0.5
-    retries -= 1
-
-    raise unless retries.positive?
-
-    retry
-  end
-
-  if missing_gamescope_thread
-    Process.kill(:SIGTERM, inside_pid.to_i)
-  end
-else
-  raise ARGV[0]
+def skip_gamescope?
+  ENV['SKIP_GAMESCOPE'] == '1'
 end
 
+def capture2e(*args, kill9: false)
+  pidqueue = Queue.new
+
+  if Thread.current[:outfile]
+    path = dir.join(Thread.current[:outfile]).to_s
+  else
+    path = dir.join('default.out').to_s
+  end
+
+  puts "path: #{path}"
+
+  pidqueue.push(spawn(*args, [:out, :err]=>[path, "w"]))
+
+  # BUG1: for some reason, sometimes spawn does not return for gamescope :/
+  puts "waiting pid(#{args})"
+
+  pid = pidqueue.pop
+
+  yield(pid) if block_given?
+
+  exited = Process.wait2(pid)
+rescue => e
+  puts "#{e.class.name}: #{e.message}"
+  puts e.backtrace
+ensure
+  begin
+    puts "killing #{pid}(#{args}) from #{argv}!"
+    puts caller
+    Process.kill((kill9 ? :SIGKILL : :SIGTERM), pid)
+  rescue => e
+    puts "#{e.class.name}: #{e.message}"
+    puts e.backtrace
+  end
+
+  exited ||= Process.wait2(pid)
+
+  puts "#{args} exited with #{exited}"
+  status = exited[1] if exited
+  log = File.read(path) if path && File.exist?(path)
+
+  puts "log done"
+
+  [status ,log]
+end
+
+if argv.size.zero?
+  begin
+    Thread.current[:outfile] = 'gamescope.out'
+
+    ENV['ENABLE_HDR_WSI'] = '1' if gamescope_args.include?('--hdr-enabled')
+    ENV['STANDALONE_GAMESCOPE_PID2'] = Process.pid.to_s
+
+    File.write(dir.join('pre.env'), JSON.pretty_generate(ENV.to_h))
+
+    if skip_gamescope?
+      command = [__FILE__, 'forward', "#{__FILE__} inside"]
+    else
+      command = ['gamescope', *gamescope_args, '--', __FILE__, 'inside']
+    end
+
+    gamescopepid = nil
+
+    # kill9 added due to BUG1
+    ret = capture2e(ENV, *command, kill9: true) do |pid|
+      gamescopepid = pid
+
+      puts "gamescopepid: #{gamescopepid}"
+    end
+
+    puts ret
+  rescue => e
+    puts "#{e.class.name}: #{e.message}"
+    puts e.backtrace
+  ensure
+    begin
+      puts "Killing gamescopepid: #{gamescopepid}"
+      `kill -9 #{gamescopepid}` if File.exist?("/proc/#{gamescopepid}")
+      # Process.kill(:SIGKILL, gamescopepid.to_i)
+    rescue => e
+      puts "#{e.class.name}: #{e.message}"
+      puts e.backtrace
+    end
+  end
+elsif argv[0] == 'inside'
+  begin
+    ENV['STANDALONE_GAMESCOPE_PID'] = Process.pid.to_s
+
+    diff = (ENV.to_h.to_a - JSON.parse(File.read(dir.join('pre.env'))).to_a).to_h
+
+    File.write(dir.join('post.env'), JSON.pretty_generate(diff))
+
+    loop { sleep 1 }
+  rescue => e
+    puts "#{e.class.name}: #{e.message}"
+    puts e.backtrace
+  ensure
+    puts "inside is exiting!"
+  end
+elsif argv[0] == 'forward'
+  Thread.current[:outfile] = 'game.out'
+  puts "forward"
+
+  ret = capture2e(ENV, *argv.drop(1))
+
+  puts ret
+elsif argv[0] == 'game'
+  Thread.current[:outfile] = 'game.out'
+
+  if ENV['XDG_SESSION_TYPE'] == 'wayland'
+    retries = 20
+    missing_gamescope_thread = nil
+
+    diff_env = nil
+    inside_pid = nil
+
+    check_gamescope = lambda do
+      diff_env = JSON.parse(File.read(dir.join('post.env'))) rescue {}
+      puts "checking pid: #{diff_env.to_json}"
+      inside_pid = diff_env['STANDALONE_GAMESCOPE_PID']
+
+      return false unless inside_pid
+
+      pid_exists = File.exist?("/proc/#{inside_pid}")
+
+      return false unless pid_exists
+
+      true
+    end
+
+    begin
+      raise NotRunningError unless check_gamescope.call
+
+      ENV.merge!(diff_env)
+      ENV.delete('WAYLAND_DISPLAY')
+
+      File.write(dir.join('game.env'), JSON.pretty_generate(ENV.to_h))
+      File.write(dir.join('game.command'), JSON.pretty_generate(argv.drop(1)))
+
+      # argv[-1] = argv[-1].sub('DS.exe', 'dgVoodooCpl.exe')
+
+      gamepid = nil
+      ret = capture2e(ENV, *argv.drop(1)) { |pid| gamepid = pid }
+
+      puts ret
+    rescue NotRunningError => e
+      puts "retrying: #{missing_gamescope_thread}"
+
+      missing_gamescope_thread ||= Thread.new do
+        Thread.current[:outfile] = 'gamescope.retry.out'
+
+        puts "Starting: #{__FILE__}"
+        subs_out = capture2e(__FILE__)
+
+        puts "subs_out: #{subs_out}"
+      ensure
+        begin
+          puts "Killing gamepid: #{gamepid}"
+          Process.kill(:SIGKILL, gamepid.to_i)
+        rescue => e
+          puts "#{e.class.name}: #{e.message}"
+          puts e.backtrace
+        end
+      end
+
+      20.times do
+        break if check_gamescope.call
+        sleep 0.2
+      end
+
+      retries -= 1
+
+      raise unless retries.positive?
+
+      retry
+    end
+
+    if missing_gamescope_thread
+      begin
+        puts "killing #{inside_pid} autostarted gamescope"
+        Process.kill(:SIGTERM, inside_pid.to_i) rescue true
+      rescue => e
+        puts "#{e.class.name}: #{e.message}"
+        puts e.backtrace
+      end
+    end
+  else
+    puts "Gamescope not supported, skipping"
+
+    ret = capture2e(ENV, *argv.drop(1))
+
+    puts ret
+  end
+else
+  raise argv[0]
+end

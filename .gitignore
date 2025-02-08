@@ -1,5 +1,3 @@
-game.command
-game.env
-game.out
-post.env
-pre.env
+*.command
+*.out
+*.env
